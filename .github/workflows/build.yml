@@ -1,0 +1,83 @@
+name: Build BlockAds.dylib
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_16.0.app || sudo xcode-select -s /Applications/Xcode.app
+
+      - name: Build dylib
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "Using SDK: $SDK"
+
+          xcrun -sdk iphoneos clang \
+            -arch arm64 -arch arm64e \
+            -dynamiclib \
+            -o BlockAds.dylib \
+            -framework UIKit \
+            -framework Foundation \
+            -framework WebKit \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=15.0 \
+            -fobjc-arc \
+            -O2 \
+            BlockAds.m
+
+          echo "=== Build info ==="
+          file BlockAds.dylib
+          ls -lh BlockAds.dylib
+
+      - name: Ad-hoc sign
+        run: codesign -f -s - BlockAds.dylib
+
+      - name: Upload dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: BlockAds.dylib
+          path: BlockAds.dylib
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: BlockAds.dylib
+
+      - name: Get version
+        id: ver
+        run: echo "tag=v1.0.0-$(date +%Y%m%d%H%M)" >> "$GITHUB_OUTPUT"
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: BlockAds ${{ steps.ver.outputs.tag }}
+          body: |
+            ## BlockAds 去广告插件
+
+            自动构建，下载 `BlockAds.dylib` 通过轻松签注入即可使用。
+
+            ### 使用方法
+            1. 下载 `BlockAds.dylib`
+            2. 打开轻松签，导入目标 IPA
+            3. 注入 `BlockAds.dylib`
+            4. 签名安装
+          files: BlockAds.dylib
