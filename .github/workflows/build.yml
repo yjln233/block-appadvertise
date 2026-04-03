@@ -14,7 +14,12 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Select Xcode
-        run: sudo xcode-select -s /Applications/Xcode_16.0.app || sudo xcode-select -s /Applications/Xcode.app
+        run: |
+          # 列出可用 Xcode 版本并选择最新的
+          ls /Applications/ | grep Xcode
+          XCODE=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
+          echo "Using: $XCODE"
+          sudo xcode-select -s "$XCODE"
 
       - name: Build dylib
         run: |
