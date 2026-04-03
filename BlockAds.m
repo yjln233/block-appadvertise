@@ -117,13 +117,38 @@ static NSError *adBlockError(void) {
                            userInfo:@{NSLocalizedDescriptionKey: @"Ad blocked"}];
 }
 
+static const NSTimeInterval kDelegateInitialDelay = 0.15;
+static const NSTimeInterval kDelegateRetryDelay = 0.10;
+static const NSInteger kDelegateRetryCount = 2;
+
+static void withResolvedDelegate(id adObj,
+                                 NSTimeInterval delay,
+                                 NSInteger remainingRetries,
+                                 void (^work)(id delegate)) {
+    if (!adObj || !work) return;
+
+    void (^workCopy)(id delegate) = [work copy];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        id delegate = getDelegate(adObj);
+        if (delegate) {
+            workCopy(delegate);
+            return;
+        }
+
+        if (remainingRetries > 0) {
+            withResolvedDelegate(adObj, kDelegateRetryDelay, remainingRetries - 1, workCopy);
+            return;
+        }
+
+        NSLog(@"[BlockAds] delegate 未就绪，放弃回调: %@", NSStringFromClass([adObj class]));
+    });
+}
+
 static void notifyFailureThenFallbackClose(id adObj,
                                            const char *failSelectors[], int failCount,
                                            const char *closeSelectors[], int closeCount) {
-    id delegate = getDelegate(adObj);
-    if (!delegate) return;
-
-    dispatch_async(dispatch_get_main_queue(), ^{
+    withResolvedDelegate(adObj, kDelegateInitialDelay, kDelegateRetryCount, ^(id delegate) {
         NSError *error = adBlockError();
         BOOL finished = callFirstDelegate2(delegate, failSelectors, failCount, adObj, error);
         if (!finished) {
@@ -133,11 +158,48 @@ static void notifyFailureThenFallbackClose(id adObj,
 }
 
 static void notifyCloseOnly(id adObj, const char *closeSelectors[], int closeCount) {
-    id delegate = getDelegate(adObj);
-    if (!delegate) return;
-
     dispatch_async(dispatch_get_main_queue(), ^{
+        id delegate = getDelegate(adObj);
+        if (!delegate) return;
         callFirstDelegate(delegate, closeSelectors, closeCount, adObj);
+    });
+}
+
+static void scheduleCloseOnly(id adObj, const char *closeSelectors[], int closeCount) {
+    withResolvedDelegate(adObj, kDelegateInitialDelay, kDelegateRetryCount, ^(id delegate) {
+        callFirstDelegate(delegate, closeSelectors, closeCount, adObj);
+    });
+}
+
+static void scheduleDelegateObjectError(id adObj, const char *failSelectors[], int failCount) {
+    withResolvedDelegate(adObj, kDelegateInitialDelay, kDelegateRetryCount, ^(id delegate) {
+        callFirstDelegate2(delegate, failSelectors, failCount, adObj, adBlockError());
+    });
+}
+
+static void scheduleDelegateErrorOnly(id adObj, const char *failSelectors[], int failCount) {
+    withResolvedDelegate(adObj, kDelegateInitialDelay, kDelegateRetryCount, ^(id delegate) {
+        callFirstDelegate(delegate, failSelectors, failCount, adBlockError());
+    });
+}
+
+static void scheduleObjectOrPlacementFailure(id adObj,
+                                             const char *objectFailSelectors[], int objectFailCount,
+                                             const char *placementFailSelectors[], int placementFailCount,
+                                             const char *closeSelectors[], int closeCount) {
+    withResolvedDelegate(adObj, kDelegateInitialDelay, kDelegateRetryCount, ^(id delegate) {
+        NSError *error = adBlockError();
+        BOOL finished = NO;
+        if (objectFailCount > 0) {
+            finished = callFirstDelegate2(delegate, objectFailSelectors, objectFailCount, adObj, error);
+        }
+        if (!finished && placementFailCount > 0) {
+            finished = callFirstDelegate2(delegate, placementFailSelectors, placementFailCount,
+                                          placementIDForAd(adObj), error);
+        }
+        if (!finished && closeCount > 0) {
+            callFirstDelegate(delegate, closeSelectors, closeCount, adObj);
+        }
     });
 }
 
@@ -337,7 +399,7 @@ static WKWebView *hook_wk_initWithFrame(WKWebView *self, SEL _cmd,
 // 穿山甲开屏: 拦截 loadAdData 后立即回调 delegate
 // delegate 方法: splashAdDidClose: / splashAd:didFailWithError:
 static void bu_splash_loadAdData(id self, SEL _cmd) {
-    NSLog(@"[BlockAds] 穿山甲开屏 loadAdData -> 立即回调关闭");
+    NSLog(@"[BlockAds] 穿山甲开屏 loadAdData -> 延迟回调");
     static const char *failSelectors[] = {
         "splashAd:didFailWithError:",
         "splashAdLoadFail:error:",
@@ -369,52 +431,53 @@ static void bu_splash_showInWindow(id self, SEL _cmd, id window, id bottomView) 
 
 // 穿山甲插屏
 static void bu_interstitial_loadAdData(id self, SEL _cmd) {
-    NSLog(@"[BlockAds] 穿山甲插屏 loadAdData -> 回调失败");
-    id delegate = getDelegate(self);
-    dispatch_async(dispatch_get_main_queue(), ^{
-        safeCallDelegate2(delegate, NSSelectorFromString(@"nativeExpressInterstitialAd:didFailWithError:"), self, adBlockError());
-    });
+    NSLog(@"[BlockAds] 穿山甲插屏 loadAdData -> 延迟回调失败");
+    static const char *failSelectors[] = {
+        "nativeExpressInterstitialAd:didFailWithError:",
+    };
+    scheduleDelegateObjectError(self, failSelectors, 1);
 }
 
 static void bu_interstitial_show(id self, SEL _cmd, id vc) {
     NSLog(@"[BlockAds] 穿山甲插屏 show -> 回调关闭");
-    id delegate = getDelegate(self);
     dispatch_async(dispatch_get_main_queue(), ^{
+        id delegate = getDelegate(self);
+        if (!delegate) return;
         safeCallDelegate(delegate, NSSelectorFromString(@"nativeExpressInterstitialAdDidClose:"), self);
     });
 }
 
 // 穿山甲激励视频
 static void bu_reward_loadAdData(id self, SEL _cmd) {
-    NSLog(@"[BlockAds] 穿山甲激励视频 loadAdData -> 回调失败");
-    id delegate = getDelegate(self);
-    dispatch_async(dispatch_get_main_queue(), ^{
-        safeCallDelegate2(delegate, NSSelectorFromString(@"nativeExpressRewardedVideoAd:didFailWithError:"), self, adBlockError());
-    });
+    NSLog(@"[BlockAds] 穿山甲激励视频 loadAdData -> 延迟回调失败");
+    static const char *failSelectors[] = {
+        "nativeExpressRewardedVideoAd:didFailWithError:",
+    };
+    scheduleDelegateObjectError(self, failSelectors, 1);
 }
 
 // 穿山甲 Banner
 static void bu_banner_loadAdData(id self, SEL _cmd) {
-    NSLog(@"[BlockAds] 穿山甲Banner loadAdData -> 回调失败");
-    id delegate = getDelegate(self);
-    dispatch_async(dispatch_get_main_queue(), ^{
-        safeCallDelegate2(delegate, NSSelectorFromString(@"nativeExpressBannerAdView:didLoadFailWithError:"), self, adBlockError());
-    });
+    NSLog(@"[BlockAds] 穿山甲Banner loadAdData -> 延迟回调失败");
+    static const char *failSelectors[] = {
+        "nativeExpressBannerAdView:didLoadFailWithError:",
+    };
+    scheduleDelegateObjectError(self, failSelectors, 1);
 }
 
 // 穿山甲全屏视频
 static void bu_fullscreen_loadAdData(id self, SEL _cmd) {
-    NSLog(@"[BlockAds] 穿山甲全屏视频 loadAdData -> 回调失败");
-    id delegate = getDelegate(self);
-    dispatch_async(dispatch_get_main_queue(), ^{
-        safeCallDelegate2(delegate, NSSelectorFromString(@"nativeExpressFullscreenVideoAd:didFailWithError:"), self, adBlockError());
-    });
+    NSLog(@"[BlockAds] 穿山甲全屏视频 loadAdData -> 延迟回调失败");
+    static const char *failSelectors[] = {
+        "nativeExpressFullscreenVideoAd:didFailWithError:",
+    };
+    scheduleDelegateObjectError(self, failSelectors, 1);
 }
 
 #pragma mark - 广点通 带 delegate 回调的 Hook
 
 static void gdt_splash_loadAd(id self, SEL _cmd) {
-    NSLog(@"[BlockAds] 广点通开屏 loadAd -> 回调关闭");
+    NSLog(@"[BlockAds] 广点通开屏 loadAd -> 延迟回调");
     static const char *failSelectors[] = {
         "splashAdFailToPresent:withError:",
     };
@@ -435,35 +498,36 @@ static void gdt_splash_show(id self, SEL _cmd, id a, id b, id c) {
 }
 
 static void gdt_interstitial_loadAd(id self, SEL _cmd) {
-    NSLog(@"[BlockAds] 广点通插屏 loadAd -> 回调失败");
-    id delegate = getDelegate(self);
-    dispatch_async(dispatch_get_main_queue(), ^{
-        safeCallDelegate2(delegate, NSSelectorFromString(@"unifiedInterstitialFailToLoadAd:error:"), self, adBlockError());
-    });
+    NSLog(@"[BlockAds] 广点通插屏 loadAd -> 延迟回调失败");
+    static const char *failSelectors[] = {
+        "unifiedInterstitialFailToLoadAd:error:",
+    };
+    scheduleDelegateObjectError(self, failSelectors, 1);
 }
 
 static void gdt_interstitial_present(id self, SEL _cmd, id vc) {
     NSLog(@"[BlockAds] 广点通插屏 present -> 回调关闭");
-    id delegate = getDelegate(self);
     dispatch_async(dispatch_get_main_queue(), ^{
+        id delegate = getDelegate(self);
+        if (!delegate) return;
         safeCallDelegate(delegate, NSSelectorFromString(@"unifiedInterstitialAdDidClose:"), self);
     });
 }
 
 static void gdt_reward_loadAd(id self, SEL _cmd) {
-    NSLog(@"[BlockAds] 广点通激励视频 loadAd -> 回调失败");
-    id delegate = getDelegate(self);
-    dispatch_async(dispatch_get_main_queue(), ^{
-        safeCallDelegate2(delegate, NSSelectorFromString(@"gdt_rewardVideoAdDidFailToLoad:error:"), self, adBlockError());
-    });
+    NSLog(@"[BlockAds] 广点通激励视频 loadAd -> 延迟回调失败");
+    static const char *failSelectors[] = {
+        "gdt_rewardVideoAdDidFailToLoad:error:",
+    };
+    scheduleDelegateObjectError(self, failSelectors, 1);
 }
 
 static void gdt_native_loadAd(id self, SEL _cmd) {
-    NSLog(@"[BlockAds] 广点通原生 loadAd -> 回调失败");
-    id delegate = getDelegate(self);
-    dispatch_async(dispatch_get_main_queue(), ^{
-        safeCallDelegate2(delegate, NSSelectorFromString(@"gdt_unifiedNativeAdLoaded:error:"), self, adBlockError());
-    });
+    NSLog(@"[BlockAds] 广点通原生 loadAd -> 延迟回调失败");
+    static const char *failSelectors[] = {
+        "gdt_unifiedNativeAdLoaded:error:",
+    };
+    scheduleDelegateObjectError(self, failSelectors, 1);
 }
 
 static void gdt_native_loadAdWithCount(id self, SEL _cmd, NSInteger count) {
@@ -471,17 +535,17 @@ static void gdt_native_loadAdWithCount(id self, SEL _cmd, NSInteger count) {
 }
 
 static void gdt_banner_loadAd(id self, SEL _cmd) {
-    NSLog(@"[BlockAds] 广点通Banner loadAdAndShow -> 回调失败");
-    id delegate = getDelegate(self);
-    dispatch_async(dispatch_get_main_queue(), ^{
-        safeCallDelegate2(delegate, NSSelectorFromString(@"unifiedBannerViewFailedToLoad:error:"), self, adBlockError());
-    });
+    NSLog(@"[BlockAds] 广点通Banner loadAdAndShow -> 延迟回调失败");
+    static const char *failSelectors[] = {
+        "unifiedBannerViewFailedToLoad:error:",
+    };
+    scheduleDelegateObjectError(self, failSelectors, 1);
 }
 
 #pragma mark - 快手 带 delegate 回调的 Hook
 
 static void ks_splash_loadAdData(id self, SEL _cmd) {
-    NSLog(@"[BlockAds] 快手开屏 loadAdData -> 回调失败");
+    NSLog(@"[BlockAds] 快手开屏 loadAdData -> 延迟回调失败");
     static const char *failSelectors[] = {
         "ksad_splashAdDidFailToLoad:withError:",
     };
@@ -506,26 +570,26 @@ static void ks_splash_showInWindow(id self, SEL _cmd, id window) {
 #pragma mark - 百度 带 delegate 回调的 Hook
 
 static void bd_splash_load(id self, SEL _cmd) {
-    NSLog(@"[BlockAds] 百度开屏 load -> 回调失败");
+    NSLog(@"[BlockAds] 百度开屏 load -> 延迟回调关闭");
     static const char *closeSelectors[] = {
         "splashAdClose:",
         "splashAdClosed:",
     };
-    notifyCloseOnly(self, closeSelectors, 2);
+    scheduleCloseOnly(self, closeSelectors, 2);
 }
 
 static void bd_interstitial_load(id self, SEL _cmd) {
-    NSLog(@"[BlockAds] 百度插屏 load -> 回调失败");
-    id delegate = getDelegate(self);
-    dispatch_async(dispatch_get_main_queue(), ^{
-        safeCallDelegate(delegate, NSSelectorFromString(@"interstitialAdLoadFail:"), adBlockError());
-    });
+    NSLog(@"[BlockAds] 百度插屏 load -> 延迟回调失败");
+    static const char *failSelectors[] = {
+        "interstitialAdLoadFail:",
+    };
+    scheduleDelegateErrorOnly(self, failSelectors, 1);
 }
 
 #pragma mark - Sigmob/Wind 带 delegate 回调的 Hook
 
 static void wind_splash_loadAdData(id self, SEL _cmd) {
-    NSLog(@"[BlockAds] Sigmob开屏 loadAdData -> 回调失败");
+    NSLog(@"[BlockAds] Sigmob开屏 loadAdData -> 延迟回调失败");
     static const char *failSelectors[] = {
         "onSplashAdLoadFail:error:",
     };
@@ -536,11 +600,11 @@ static void wind_splash_loadAdData(id self, SEL _cmd) {
 }
 
 static void wind_interstitial_loadAdData(id self, SEL _cmd) {
-    NSLog(@"[BlockAds] Sigmob插屏 loadAdData -> 回调失败");
-    id delegate = getDelegate(self);
-    dispatch_async(dispatch_get_main_queue(), ^{
-        safeCallDelegate2(delegate, NSSelectorFromString(@"onInterstitialAdLoadFail:error:"), self, adBlockError());
-    });
+    NSLog(@"[BlockAds] Sigmob插屏 loadAdData -> 延迟回调失败");
+    static const char *failSelectors[] = {
+        "onInterstitialAdLoadFail:error:",
+    };
+    scheduleDelegateObjectError(self, failSelectors, 1);
 }
 
 #pragma mark - AdMob 带 callback 的 Hook
@@ -566,19 +630,20 @@ static void gad_reward_load(id self, SEL _cmd, id unitID, id request, void (^han
 }
 
 static void gad_banner_load(id self, SEL _cmd, id request) {
-    NSLog(@"[BlockAds] AdMob Banner load -> 回调失败");
-    id delegate = getDelegate(self);
-    dispatch_async(dispatch_get_main_queue(), ^{
-        safeCallDelegate2(delegate, NSSelectorFromString(@"bannerView:didFailToReceiveAdWithError:"), self, adBlockError());
-    });
+    NSLog(@"[BlockAds] AdMob Banner load -> 延迟回调失败");
+    static const char *failSelectors[] = {
+        "bannerView:didFailToReceiveAdWithError:",
+    };
+    scheduleDelegateObjectError(self, failSelectors, 1);
 }
 
 #pragma mark - AppLovin Hook
 
 static void al_interstitial_show(id self, SEL _cmd) {
     NSLog(@"[BlockAds] AppLovin插屏 show -> 回调关闭");
-    id delegate = getDelegate(self);
     dispatch_async(dispatch_get_main_queue(), ^{
+        id delegate = getDelegate(self);
+        if (!delegate) return;
         safeCallDelegate(delegate, NSSelectorFromString(@"adHidden:"), self);
     });
 }
@@ -586,24 +651,19 @@ static void al_interstitial_show(id self, SEL _cmd) {
 #pragma mark - GroMore/TopOn/TradPlus 聚合 SDK Hook
 
 static void agg_splash_loadAdData(id self, SEL _cmd) {
-    NSLog(@"[BlockAds] 聚合开屏 loadAdData -> 回调失败");
-    id delegate = getDelegate(self);
-    if (!delegate) return;
-
-    dispatch_async(dispatch_get_main_queue(), ^{
-        NSError *error = adBlockError();
-        BOOL finished = callFirstDelegate2(delegate,
-                                           (const char *[]){"splashAd:didFailWithError:"},
-                                           1, self, error);
-        if (!finished) {
-            finished = callFirstDelegate2(delegate,
-                                          (const char *[]){"didFailToLoadADWithPlacementID:error:"},
-                                          1, placementIDForAd(self), error);
-        }
-        if (!finished) {
-            callFirstDelegate(delegate, (const char *[]){"splashAdDidClose:"}, 1, self);
-        }
-    });
+    NSLog(@"[BlockAds] 聚合开屏 loadAdData -> 延迟回调失败");
+    static const char *objectFailSelectors[] = {
+        "splashAd:didFailWithError:",
+    };
+    static const char *placementFailSelectors[] = {
+        "didFailToLoadADWithPlacementID:error:",
+    };
+    static const char *closeSelectors[] = {
+        "splashAdDidClose:",
+    };
+    scheduleObjectOrPlacementFailure(self, objectFailSelectors, 1,
+                                     placementFailSelectors, 1,
+                                     closeSelectors, 1);
 }
 
 static void agg_splash_show(id self, SEL _cmd, id arg) {
@@ -615,39 +675,29 @@ static void agg_splash_show(id self, SEL _cmd, id arg) {
 }
 
 static void agg_interstitial_loadAdData(id self, SEL _cmd) {
-    NSLog(@"[BlockAds] 聚合插屏 loadAdData -> 回调失败");
-    id delegate = getDelegate(self);
-    if (!delegate) return;
-
-    dispatch_async(dispatch_get_main_queue(), ^{
-        NSError *error = adBlockError();
-        BOOL finished = callFirstDelegate2(delegate,
-                                           (const char *[]){"interstitialAd:didFailWithError:"},
-                                           1, self, error);
-        if (!finished) {
-            callFirstDelegate2(delegate,
-                               (const char *[]){"didFailToLoadADWithPlacementID:error:"},
-                               1, placementIDForAd(self), error);
-        }
-    });
+    NSLog(@"[BlockAds] 聚合插屏 loadAdData -> 延迟回调失败");
+    static const char *objectFailSelectors[] = {
+        "interstitialAd:didFailWithError:",
+    };
+    static const char *placementFailSelectors[] = {
+        "didFailToLoadADWithPlacementID:error:",
+    };
+    scheduleObjectOrPlacementFailure(self, objectFailSelectors, 1,
+                                     placementFailSelectors, 1,
+                                     NULL, 0);
 }
 
 static void agg_reward_loadAdData(id self, SEL _cmd) {
-    NSLog(@"[BlockAds] 聚合激励 loadAdData -> 回调失败");
-    id delegate = getDelegate(self);
-    if (!delegate) return;
-
-    dispatch_async(dispatch_get_main_queue(), ^{
-        NSError *error = adBlockError();
-        BOOL finished = callFirstDelegate2(delegate,
-                                           (const char *[]){"rewardedVideoAd:didFailWithError:"},
-                                           1, self, error);
-        if (!finished) {
-            callFirstDelegate2(delegate,
-                               (const char *[]){"didFailToLoadADWithPlacementID:error:"},
-                               1, placementIDForAd(self), error);
-        }
-    });
+    NSLog(@"[BlockAds] 聚合激励 loadAdData -> 延迟回调失败");
+    static const char *objectFailSelectors[] = {
+        "rewardedVideoAd:didFailWithError:",
+    };
+    static const char *placementFailSelectors[] = {
+        "didFailToLoadADWithPlacementID:error:",
+    };
+    scheduleObjectOrPlacementFailure(self, objectFailSelectors, 1,
+                                     placementFailSelectors, 1,
+                                     NULL, 0);
 }
 
 #pragma mark - 通用空实现 (fallback)
