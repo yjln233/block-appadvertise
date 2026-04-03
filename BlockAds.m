@@ -1,13 +1,12 @@
 /**
- * BlockAds - iOS 去广告插件 v3.1
+ * BlockAds - 当前 App 启动广告拦截插件 v4.0
  * 纯 ObjC Runtime，无越狱依赖，轻松签注入
  *
  * 核心机制:
- * 1. _dyld_register_func_for_add_image 监听动态库加载，SDK 类出现时立即 hook
- * 2. NSURLProtocol 网络层拦截广告请求
- * 3. UIView addSubview 视图层拦截广告视图
- * 4. UIViewController present 拦截广告页面
- * 5. 主动回调 delegate 通知"广告关闭/失败"，避免 app 黑屏等待
+ * 1. 直接拦截当前 App 的 AdSplash / TMEAd 开屏链路
+ * 2. 强制提前结束启动广告状态机，避免等待选单/资源/跳过计时
+ * 3. 主动移除 AppDelegate 启动遮罩和 AdSplash 自己的开屏容器
+ * 4. 保留最小视图层兜底，处理残留的启动广告视图
  */
 
 #import <UIKit/UIKit.h>
@@ -318,6 +317,9 @@ static NSArray<NSString *> *adClassKeywords(void) {
             @"TradPlusSplash", @"TradPlusInterstitial",
             @"SplashAdView", @"SplashViewController",
             @"AdViewController", @"AdDialogView",
+            @"AdTmeSplashView", @"TMEBDAdSRenderView", @"AdBottomGradientView",
+            @"TMEAdAnimationView", @"TMEAdSwipeTrackingView", @"TMEAdCustomLabel",
+            @"PADClickSlideView", @"PADClickSlideShakeView", @"PADSlideTipsView",
         ];
     });
     return list;
@@ -329,6 +331,241 @@ static BOOL isAdClass(NSString *name) {
         if ([name containsString:kw]) return YES;
     }
     return NO;
+}
+
+#pragma mark - 当前 App 开屏专用逻辑
+
+static const void *kBlockAdsHandledKey = &kBlockAdsHandledKey;
+
+static IMP orig_adSplash_failToPresent = NULL;
+static IMP orig_adSplash_willClosed = NULL;
+static IMP orig_adSplash_closed = NULL;
+static IMP orig_adSplash_finished = NULL;
+static IMP orig_manager_failToPresent = NULL;
+static IMP orig_manager_pSplashClosed = NULL;
+static IMP orig_tmeSplash_handler_failToPresent = NULL;
+static IMP orig_tmeSplash_handler_closed = NULL;
+
+static BOOL markHandledObject(id obj) {
+    if (!obj) return NO;
+    if (objc_getAssociatedObject(obj, kBlockAdsHandledKey)) return NO;
+    objc_setAssociatedObject(obj, kBlockAdsHandledKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return YES;
+}
+
+static void safeCallObject0(id obj, SEL sel) {
+    if (!obj || !sel || ![obj respondsToSelector:sel]) return;
+    ((void(*)(id, SEL))objc_msgSend)(obj, sel);
+}
+
+static void safeCallObject1(id obj, SEL sel, id arg) {
+    if (!obj || !sel || ![obj respondsToSelector:sel]) return;
+    ((void(*)(id, SEL, id))objc_msgSend)(obj, sel, arg);
+}
+
+static void safeCallObject2(id obj, SEL sel, id arg1, id arg2) {
+    if (!obj || !sel || ![obj respondsToSelector:sel]) return;
+    ((void(*)(id, SEL, id, id))objc_msgSend)(obj, sel, arg1, arg2);
+}
+
+static void safeCallObjectU64(id obj, SEL sel, unsigned long long arg) {
+    if (!obj || !sel || ![obj respondsToSelector:sel]) return;
+    ((void(*)(id, SEL, unsigned long long))objc_msgSend)(obj, sel, arg);
+}
+
+static BOOL isCurrentAppSplashManager(id obj) {
+    if (!obj) return NO;
+    return [obj respondsToSelector:NSSelectorFromString(@"skipAdSplash")] ||
+           [obj respondsToSelector:NSSelectorFromString(@"splashAdFailToPresent:")] ||
+           [obj respondsToSelector:NSSelectorFromString(@"p_splashAdClosed")];
+}
+
+static id currentAppSplashManager(id obj) {
+    if (isCurrentAppSplashManager(obj)) return obj;
+
+    id splashAd = safeObjectGetter(obj, NSSelectorFromString(@"splashAd"));
+    if (isCurrentAppSplashManager(splashAd)) return splashAd;
+
+    id delegate = getDelegate(obj);
+    if (isCurrentAppSplashManager(delegate)) return delegate;
+
+    id delegateSplashAd = safeObjectGetter(delegate, NSSelectorFromString(@"splashAd"));
+    if (isCurrentAppSplashManager(delegateSplashAd)) return delegateSplashAd;
+
+    return nil;
+}
+
+static id currentAppAdSplashOwner(id obj) {
+    if (obj && [obj respondsToSelector:NSSelectorFromString(@"removSplashView")]) {
+        return obj;
+    }
+
+    id delegate = getDelegate(obj);
+    if (delegate && [delegate respondsToSelector:NSSelectorFromString(@"removSplashView")]) {
+        return delegate;
+    }
+
+    id splashAd = safeObjectGetter(obj, NSSelectorFromString(@"splashAd"));
+    if (splashAd && [splashAd respondsToSelector:NSSelectorFromString(@"removSplashView")]) {
+        return splashAd;
+    }
+
+    return nil;
+}
+
+static void removeCurrentAppLaunchImage(void) {
+    id appDelegate = safeObjectGetter(UIApplication.sharedApplication, @selector(delegate));
+    safeCallObject0(appDelegate, NSSelectorFromString(@"removeSplashLaunchImage"));
+}
+
+static void clearCurrentAppSplashUI(id obj, NSString *reason) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        id adSplashOwner = currentAppAdSplashOwner(obj);
+        NSLog(@"[BlockAds] 清理启动遮罩: %@", reason ?: @"unknown");
+        removeCurrentAppLaunchImage();
+        safeCallObject0(adSplashOwner, NSSelectorFromString(@"removSplashView"));
+
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.30 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            removeCurrentAppLaunchImage();
+            safeCallObject0(adSplashOwner, NSSelectorFromString(@"removSplashView"));
+        });
+    });
+}
+
+static void driveCurrentAppSplashFailure(id obj, NSString *reason) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        id manager = currentAppSplashManager(obj);
+
+        if ([obj respondsToSelector:NSSelectorFromString(@"handler_splashAdFailToPresent:withError:")]) {
+            safeCallObject2(obj, NSSelectorFromString(@"handler_splashAdFailToPresent:withError:"), nil, adBlockError());
+        } else if (manager && [manager respondsToSelector:NSSelectorFromString(@"splashAdFailToPresent:")]) {
+            safeCallObjectU64(manager, NSSelectorFromString(@"splashAdFailToPresent:"), 0);
+        } else if (manager && [manager respondsToSelector:NSSelectorFromString(@"skipAdSplash")]) {
+            safeCallObject0(manager, NSSelectorFromString(@"skipAdSplash"));
+        } else if (manager && [manager respondsToSelector:NSSelectorFromString(@"p_splashAdClosed")]) {
+            safeCallObject0(manager, NSSelectorFromString(@"p_splashAdClosed"));
+        }
+
+        clearCurrentAppSplashUI(obj, reason);
+    });
+}
+
+static void fastFinishCurrentAppSplash(id obj, NSString *reason) {
+    if (!markHandledObject(obj)) {
+        clearCurrentAppSplashUI(obj, reason);
+        return;
+    }
+    driveCurrentAppSplashFailure(obj, reason);
+}
+
+static void hook_app_delegate_bd_removeSplashLaunchImage(id self, SEL _cmd) {
+    NSLog(@"[BlockAds] 加速移除 AppDelegate 启动遮罩");
+    clearCurrentAppSplashUI(nil, @"AppDelegate bd_removeSplashLaunchImage");
+}
+
+static void hook_current_app_preSelectorOrderAtLaunch(id self, SEL _cmd, BOOL isHotLaunch) {
+    NSLog(@"[BlockAds] 跳过当前 App 开屏预选单");
+    fastFinishCurrentAppSplash(self, @"AdSplash preSelectorOrderAtLaunch");
+}
+
+static void hook_current_app_showSplashAtLaunch(id self, SEL _cmd) {
+    NSLog(@"[BlockAds] 跳过当前 App 开屏展示入口");
+    fastFinishCurrentAppSplash(self, @"AdSplash showSplashAtLaunch");
+}
+
+static void hook_current_app_adSplashFailToPresent(id self, SEL _cmd, id ad, id error) {
+    if (orig_adSplash_failToPresent) {
+        ((void(*)(id, SEL, id, id))orig_adSplash_failToPresent)(self, _cmd, ad, error);
+    }
+    clearCurrentAppSplashUI(self, @"AdSplash splashAdFailToPresent");
+}
+
+static void hook_current_app_adSplashWillClosed(id self, SEL _cmd, id ad) {
+    if (orig_adSplash_willClosed) {
+        ((void(*)(id, SEL, id))orig_adSplash_willClosed)(self, _cmd, ad);
+    }
+    clearCurrentAppSplashUI(self, @"AdSplash splashAdWillClosed");
+}
+
+static void hook_current_app_adSplashClosed(id self, SEL _cmd, id ad) {
+    if (orig_adSplash_closed) {
+        ((void(*)(id, SEL, id))orig_adSplash_closed)(self, _cmd, ad);
+    }
+    clearCurrentAppSplashUI(self, @"AdSplash splashAdClosed");
+}
+
+static void hook_current_app_adSplashFinished(id self, SEL _cmd, id ad, long long finishType) {
+    if (orig_adSplash_finished) {
+        ((void(*)(id, SEL, id, long long))orig_adSplash_finished)(self, _cmd, ad, finishType);
+    }
+    clearCurrentAppSplashUI(self, @"AdSplash splashShowFinished");
+}
+
+static void hook_current_app_operateSplashLoadAndShow(id self, SEL _cmd, id customUI, id containerView) {
+    NSLog(@"[BlockAds] 短路 TMEAdOperateSplash loadAndShow");
+    fastFinishCurrentAppSplash(self, @"TMEAdOperateSplash loadAndShow");
+}
+
+static BOOL hook_current_app_operateSplashShow(id self, SEL _cmd, id order, id customUI, id containerView) {
+    NSLog(@"[BlockAds] 阻止 TMEAdOperateSplash 真正展示开屏");
+    fastFinishCurrentAppSplash(self, @"TMEAdOperateSplash showSplash");
+    return NO;
+}
+
+static void hook_current_app_managerStartSkipTimer(id self, SEL _cmd) {
+    NSLog(@"[BlockAds] 跳过当前 App 原始 5 秒倒计时");
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        safeCallObject0(self, NSSelectorFromString(@"skipAdSplash"));
+        clearCurrentAppSplashUI(self, @"TMEAdOperateSplashManager startSkipDispathTimer");
+    });
+}
+
+static BOOL hook_current_app_managerShow(id self, SEL _cmd, id order, id customUI, id containerView) {
+    NSLog(@"[BlockAds] 阻止 TMEAdOperateSplashManager 展示开屏");
+    fastFinishCurrentAppSplash(self, @"TMEAdOperateSplashManager showSplash");
+    return NO;
+}
+
+static void hook_current_app_managerFailToPresent(id self, SEL _cmd, unsigned long long code) {
+    if (orig_manager_failToPresent) {
+        ((void(*)(id, SEL, unsigned long long))orig_manager_failToPresent)(self, _cmd, code);
+    }
+    clearCurrentAppSplashUI(self, @"TMEAdOperateSplashManager splashAdFailToPresent");
+}
+
+static void hook_current_app_managerClosed(id self, SEL _cmd) {
+    if (orig_manager_pSplashClosed) {
+        ((void(*)(id, SEL))orig_manager_pSplashClosed)(self, _cmd);
+    }
+    clearCurrentAppSplashUI(self, @"TMEAdOperateSplashManager p_splashAdClosed");
+}
+
+static void hook_current_app_tmeSplashLoadAndShow(id self, SEL _cmd, id customUI, id containerView) {
+    NSLog(@"[BlockAds] 短路 TMEAdSplashAd loadAndShow");
+    safeCallObject0(self, NSSelectorFromString(@"loader_loadAdTimeout"));
+    fastFinishCurrentAppSplash(self, @"TMEAdSplashAd loadAndShow");
+}
+
+static void hook_current_app_tmeSplashLoadData(id self, SEL _cmd, id platformId) {
+    NSLog(@"[BlockAds] 阻止 TMEAdSplashAd 发起真实加载");
+    safeCallObject0(self, NSSelectorFromString(@"loader_loadAdTimeout"));
+    fastFinishCurrentAppSplash(self, @"TMEAdSplashAd loader_loadAdDataWithPlatformId");
+}
+
+static void hook_current_app_tmeSplashHandlerFail(id self, SEL _cmd, id ad, id error) {
+    if (orig_tmeSplash_handler_failToPresent) {
+        ((void(*)(id, SEL, id, id))orig_tmeSplash_handler_failToPresent)(self, _cmd, ad, error);
+    }
+    clearCurrentAppSplashUI(self, @"TMEAdSplashAd handler_splashAdFailToPresent");
+}
+
+static void hook_current_app_tmeSplashHandlerClosed(id self, SEL _cmd, id ad) {
+    if (orig_tmeSplash_handler_closed) {
+        ((void(*)(id, SEL, id))orig_tmeSplash_handler_closed)(self, _cmd, ad);
+    }
+    clearCurrentAppSplashUI(self, @"TMEAdSplashAd handler_splashAdClosed");
 }
 
 #pragma mark - UIView Hook
@@ -713,95 +950,38 @@ static void stub_arg1(id self, SEL _cmd, id a) {
 
 static NSMutableSet *hookedClasses = nil;
 
-// Hook 定义表: 类名 -> 方法 -> 带 delegate 回调的替换函数
+// Hook 定义表: 只保留当前 App 开屏广告链路
 static void tryHookAdClasses(void) {
-    // 用 struct 数组定义所有要 hook 的方法
     struct HookEntry {
         const char *cls;
         BOOL isClass;
         SEL sel;
         IMP imp;
+        IMP *orig;
     };
 
     struct HookEntry entries[] = {
-        // ---- 穿山甲 开屏 ----
-        {"BUSplashAdView", NO, @selector(loadAdData), (IMP)bu_splash_loadAdData},
-        {"BUSplashAdView", NO, @selector(showSplashViewInRootViewController:), (IMP)bu_splash_show},
-        {"BUSplashAdView", NO, @selector(showInWindow:withBottomView:), (IMP)bu_splash_showInWindow},
-        {"BUSplashAd",     NO, @selector(loadAdData), (IMP)bu_splash_loadAdData},
-        {"BUSplashAd",     NO, @selector(showSplashViewInRootViewController:), (IMP)bu_splash_show},
-        {"CSJSplashAd",    NO, @selector(loadAdData), (IMP)bu_splash_loadAdData},
-        {"CSJSplashAd",    NO, @selector(showSplashViewInRootViewController:), (IMP)bu_splash_show},
-        // 穿山甲 插屏
-        {"BUNativeExpressInterstitialAd", NO, @selector(loadAdData), (IMP)bu_interstitial_loadAdData},
-        {"BUNativeExpressInterstitialAd", NO, @selector(showAdFromRootViewController:), (IMP)bu_interstitial_show},
-        // 穿山甲 Banner
-        {"BUNativeExpressBannerView", NO, @selector(loadAdData), (IMP)bu_banner_loadAdData},
-        // 穿山甲 激励视频
-        {"BUNativeExpressRewardedVideoAd", NO, @selector(loadAdData), (IMP)bu_reward_loadAdData},
-        {"BUNativeExpressRewardedVideoAd", NO, @selector(showAdFromRootViewController:), (IMP)stub_arg1},
-        // 穿山甲 全屏视频
-        {"BUNativeExpressFullscreenVideoAd", NO, @selector(loadAdData), (IMP)bu_fullscreen_loadAdData},
-        {"BUNativeExpressFullscreenVideoAd", NO, @selector(showAdFromRootViewController:), (IMP)stub_arg1},
+        {"AppDelegate", NO, @selector(bd_removeSplashLaunchImage), (IMP)hook_app_delegate_bd_removeSplashLaunchImage, NULL},
 
-        // ---- 广点通 ----
-        {"GDTSplashAd",             NO, @selector(loadAd), (IMP)gdt_splash_loadAd},
-        {"GDTSplashAd",             NO, @selector(loadAdAndShow), (IMP)gdt_splash_loadAd},
-        {"GDTSplashAd",             NO, @selector(showAdInWindow:withBottomView:skipView:), (IMP)gdt_splash_show},
-        {"GDTUnifiedInterstitialAd",NO, @selector(loadAd), (IMP)gdt_interstitial_loadAd},
-        {"GDTUnifiedInterstitialAd",NO, @selector(presentAdFromRootViewController:), (IMP)gdt_interstitial_present},
-        {"GDTUnifiedBannerView",    NO, @selector(loadAdAndShow), (IMP)gdt_banner_loadAd},
-        {"GDTUnifiedNativeAd",      NO, @selector(loadAd), (IMP)gdt_native_loadAd},
-        {"GDTUnifiedNativeAd",      NO, @selector(loadAdWithAdCount:), (IMP)gdt_native_loadAdWithCount},
-        {"GDTRewardVideoAd",        NO, @selector(loadAd), (IMP)gdt_reward_loadAd},
-        {"GDTRewardVideoAd",        NO, @selector(showAdFromRootViewController:), (IMP)stub_arg1},
+        {"AdSplash", NO, @selector(preSelectorOrderAtLaunch:), (IMP)hook_current_app_preSelectorOrderAtLaunch, NULL},
+        {"AdSplash", NO, @selector(showSplashAtLaunch), (IMP)hook_current_app_showSplashAtLaunch, NULL},
+        {"AdSplash", NO, @selector(splashAdFailToPresent:withError:), (IMP)hook_current_app_adSplashFailToPresent, &orig_adSplash_failToPresent},
+        {"AdSplash", NO, @selector(splashAdWillClosed:), (IMP)hook_current_app_adSplashWillClosed, &orig_adSplash_willClosed},
+        {"AdSplash", NO, @selector(splashAdClosed:), (IMP)hook_current_app_adSplashClosed, &orig_adSplash_closed},
+        {"AdSplash", NO, @selector(splashShowFininshed:finishType:), (IMP)hook_current_app_adSplashFinished, &orig_adSplash_finished},
 
-        // ---- 快手 ----
-        {"KSSplashAdView",    NO, @selector(loadAdData), (IMP)ks_splash_loadAdData},
-        {"KSAdSplashManager", NO, @selector(loadSplashAdWithRequest:), (IMP)ks_splash_loadWithRequest},
-        {"KSAdSplashManager", NO, @selector(showSplashAdInWindow:), (IMP)ks_splash_showInWindow},
+        {"TMEAdOperateSplash", NO, @selector(loadAdAndShowSplashWithCustomUIModel:inContainerView:), (IMP)hook_current_app_operateSplashLoadAndShow, NULL},
+        {"TMEAdOperateSplash", NO, @selector(showSplashWithOrder:withCustomUI:inContainerView:), (IMP)hook_current_app_operateSplashShow, NULL},
 
-        // ---- 百度 ----
-        {"BaiduMobAdSplash",       NO, @selector(load), (IMP)bd_splash_load},
-        {"BaiduMobAdSplash",       NO, @selector(show), (IMP)stub_void},
-        {"BaiduMobAdInterstitial", NO, @selector(load), (IMP)bd_interstitial_load},
-        {"BaiduMobAdInterstitial", NO, @selector(showFromViewController:), (IMP)stub_arg1},
-        {"BaiduMobAdNative",       NO, @selector(requestNativeAds), (IMP)stub_void},
+        {"TMEAdOperateSplashManager", NO, @selector(startSkipDispathTimer), (IMP)hook_current_app_managerStartSkipTimer, NULL},
+        {"TMEAdOperateSplashManager", NO, @selector(showSplashWithOrder:withCustomUI:inContainerView:), (IMP)hook_current_app_managerShow, NULL},
+        {"TMEAdOperateSplashManager", NO, @selector(splashAdFailToPresent:), (IMP)hook_current_app_managerFailToPresent, &orig_manager_failToPresent},
+        {"TMEAdOperateSplashManager", NO, @selector(p_splashAdClosed), (IMP)hook_current_app_managerClosed, &orig_manager_pSplashClosed},
 
-        // ---- Sigmob ----
-        {"WindSplashAdView",   NO, @selector(loadAdData), (IMP)wind_splash_loadAdData},
-        {"WindInterstitialAd", NO, @selector(loadAdData), (IMP)wind_interstitial_loadAdData},
-        {"WindInterstitialAd", NO, @selector(showAdFromRootViewController:), (IMP)stub_arg1},
-        {"WindRewardVideoAd",  NO, @selector(loadAdData), (IMP)stub_void},
-        {"WindRewardVideoAd",  NO, @selector(showAdFromRootViewController:), (IMP)stub_arg1},
-
-        // ---- AdMob ----
-        {"GADInterstitialAd", YES, @selector(loadWithAdUnitID:request:completionHandler:), (IMP)gad_interstitial_load},
-        {"GADRewardedAd",     YES, @selector(loadWithAdUnitID:request:completionHandler:), (IMP)gad_reward_load},
-        {"GADBannerView",     NO, @selector(loadRequest:), (IMP)gad_banner_load},
-
-        // ---- AppLovin ----
-        {"ALInterstitialAd", NO, @selector(show), (IMP)al_interstitial_show},
-        {"ALInterstitialAd", NO, @selector(showAd:), (IMP)stub_arg1},
-        {"ALAdView",         NO, @selector(loadNextAd), (IMP)stub_void},
-        {"ALAdView",         NO, @selector(render:), (IMP)stub_arg1},
-
-        // ---- GroMore ----
-        {"ABUSplashAd",          NO, @selector(loadAdData), (IMP)agg_splash_loadAdData},
-        {"ABUSplashAd",          NO, @selector(showSplashViewInRootViewController:), (IMP)agg_splash_show},
-        {"ABUInterstitialProAd", NO, @selector(loadAdData), (IMP)agg_interstitial_loadAdData},
-        {"ABUInterstitialProAd", NO, @selector(showAdFromRootViewController:), (IMP)stub_arg1},
-        {"ABURewardedVideoAd",   NO, @selector(loadAdData), (IMP)agg_reward_loadAdData},
-        {"ABURewardedVideoAd",   NO, @selector(showAdFromRootViewController:), (IMP)stub_arg1},
-
-        // ---- TopOn ----
-        {"ATSplashAd",       NO, @selector(loadAd), (IMP)agg_splash_loadAdData},
-        {"ATSplashAd",       NO, @selector(showSplashAdInWindow:), (IMP)agg_splash_show},
-        {"ATInterstitialAd", NO, @selector(loadAd), (IMP)agg_interstitial_loadAdData},
-        {"ATInterstitialAd", NO, @selector(showInRootViewController:), (IMP)stub_arg1},
-
-        // ---- TradPlus ----
-        {"TradPlusSplashAd", NO, @selector(loadAd), (IMP)agg_splash_loadAdData},
+        {"TMEAdSplashAd", NO, @selector(loadAdAndShowSplashWithCustomUIModel:inContainerView:), (IMP)hook_current_app_tmeSplashLoadAndShow, NULL},
+        {"TMEAdSplashAd", NO, @selector(loader_loadAdDataWithPlatformId:), (IMP)hook_current_app_tmeSplashLoadData, NULL},
+        {"TMEAdSplashAd", NO, @selector(handler_splashAdFailToPresent:withError:), (IMP)hook_current_app_tmeSplashHandlerFail, &orig_tmeSplash_handler_failToPresent},
+        {"TMEAdSplashAd", NO, @selector(handler_splashAdClosed:), (IMP)hook_current_app_tmeSplashHandlerClosed, &orig_tmeSplash_handler_closed},
     };
 
     int total = sizeof(entries) / sizeof(entries[0]);
@@ -823,11 +1003,9 @@ static void tryHookAdClasses(void) {
               entries[i].cls, sel_getName(entries[i].sel));
 
         if (entries[i].isClass) {
-            method_setImplementation(
-                class_getInstanceMethod(object_getClass(cls), entries[i].sel),
-                entries[i].imp);
+            swizzleClassMethod(cls, entries[i].sel, entries[i].imp, entries[i].orig);
         } else {
-            method_setImplementation(m, entries[i].imp);
+            swizzleMethod(cls, entries[i].sel, entries[i].imp, entries[i].orig);
         }
         [hookedClasses addObject:name];
     }
@@ -859,24 +1037,12 @@ static void scanAndRemoveAdViews(void) {
 __attribute__((constructor))
 static void BlockAdsInit(void) {
     NSLog(@"[BlockAds] ======================================");
-    NSLog(@"[BlockAds] 去广告插件 v3.1 已加载");
+    NSLog(@"[BlockAds] 当前 App 启动广告插件 v4.0 已加载");
     NSLog(@"[BlockAds] ======================================");
 
     hookedClasses = [NSMutableSet set];
 
-    // 1. NSURLProtocol 网络拦截
-    [NSURLProtocol registerClass:[BlockAdsURLProtocol class]];
-    Class browsingCtx = NSClassFromString(@"WKBrowsingContextController");
-    if (browsingCtx) {
-        SEL regSel = NSSelectorFromString(@"registerSchemeForCustomProtocol:");
-        if ([browsingCtx respondsToSelector:regSel]) {
-            ((void(*)(id, SEL, id))objc_msgSend)(browsingCtx, regSel, @"http");
-            ((void(*)(id, SEL, id))objc_msgSend)(browsingCtx, regSel, @"https");
-        }
-    }
-    NSLog(@"[BlockAds] 网络拦截已启用");
-
-    // 2. UIView hook
+    // 1. UIView hook
     swizzleMethod([UIView class], @selector(addSubview:),
                   (IMP)hook_addSubview, &orig_addSubview);
     swizzleMethod([UIView class], @selector(insertSubview:atIndex:),
@@ -884,23 +1050,18 @@ static void BlockAdsInit(void) {
     swizzleMethod([UIView class], @selector(insertSubview:aboveSubview:),
                   (IMP)hook_insertAbove, &orig_insertAbove);
 
-    // 3. UIViewController present hook
+    // 2. UIViewController present hook
     swizzleMethod([UIViewController class],
                   @selector(presentViewController:animated:completion:),
                   (IMP)hook_present, &orig_present);
 
-    // 4. WKWebView 脚本注入
-    swizzleMethod([WKWebView class],
-                  @selector(initWithFrame:configuration:),
-                  (IMP)hook_wk_initWithFrame, &orig_wk_init);
-
-    // 5. 立即尝试 hook 已加载的 SDK
+    // 3. 立即尝试 hook 当前 App 已加载的开屏链路
     tryHookAdClasses();
 
-    // 6. dyld 回调监听后续加载
+    // 4. dyld 回调监听后续加载
     _dyld_register_func_for_add_image(onImageAdded);
 
-    // 7. 兜底扫描
+    // 5. 兜底扫描，防止 AdSplash 自定义视图残留
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
         NSTimer *timer = [NSTimer timerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t) {
             scanAndRemoveAdViews();
@@ -911,5 +1072,5 @@ static void BlockAdsInit(void) {
         });
     });
 
-    NSLog(@"[BlockAds] 所有拦截机制已就绪 (含 delegate 回调)");
+    NSLog(@"[BlockAds] 当前 App 开屏拦截已就绪");
 }
