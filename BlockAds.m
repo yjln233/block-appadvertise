@@ -177,16 +177,16 @@ static void hookMethods(const char *clsName, BOOL isClassMethod, SEL *sels, int 
     }
 }
 
+static void hooked_didMoveToSuperview(UIView *self, SEL _cmd) {
+    self.hidden = YES;
+    self.alpha = 0;
+    [self removeFromSuperview];
+}
+
 static void hookAdViewRemoval(const char *clsName) {
     Class cls = objc_getClass(clsName);
     if (!cls) return;
-    hookMethod(cls, @selector(didMoveToSuperview), (IMP)(void (*)(UIView *, SEL)){
-        ^(UIView *self, SEL _cmd) {
-            self.hidden = YES;
-            self.alpha = 0;
-            [self removeFromSuperview];
-        }
-    }, NULL);
+    hookMethod(cls, @selector(didMoveToSuperview), (IMP)hooked_didMoveToSuperview, NULL);
 }
 
 // ============================================================

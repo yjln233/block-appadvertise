@@ -46,38 +46,3 @@ jobs:
         with:
           name: BlockAds.dylib
           path: BlockAds.dylib
-
-  release:
-    needs: build
-    runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: BlockAds.dylib
-
-      - name: Get version
-        id: ver
-        run: echo "tag=v1.0.0-$(date +%Y%m%d%H%M)" >> "$GITHUB_OUTPUT"
-
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.ver.outputs.tag }}
-          name: BlockAds ${{ steps.ver.outputs.tag }}
-          body: |
-            ## BlockAds 去广告插件
-
-            自动构建，下载 `BlockAds.dylib` 通过轻松签注入即可使用。
-
-            ### 使用方法
-            1. 下载 `BlockAds.dylib`
-            2. 打开轻松签，导入目标 IPA
-            3. 注入 `BlockAds.dylib`
-            4. 签名安装
-          files: BlockAds.dylib
