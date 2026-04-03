@@ -1,11 +1,11 @@
 /**
- * BlockAds - 当前 App 启动广告拦截插件 v4.0
+ * BlockAds - 当前 App 启动广告拦截插件 v5.1
  * 纯 ObjC Runtime，无越狱依赖，轻松签注入
  *
  * 核心机制:
  * 1. 直接拦截当前 App 的 AdSplash / TMEAd 开屏链路
  * 2. 强制提前结束启动广告状态机，避免等待选单/资源/跳过计时
- * 3. 主动移除 AppDelegate 启动遮罩和 AdSplash 自己的开屏容器
+ * 3. 等待 Flutter 渲染就绪后再移除启动遮罩，避免黑屏
  * 4. 保留最小视图层兜底，处理残留的启动广告视图
  */
 
@@ -333,6 +333,51 @@ static BOOL isAdClass(NSString *name) {
     return NO;
 }
 
+static void safeCallObject0(id obj, SEL sel);
+
+#pragma mark - Flutter 就绪检测与启动遮罩延迟移除
+
+static BOOL sFlutterViewDidAppear = NO;
+static BOOL sNeedRemoveLaunchImage = NO;
+
+static void performRemoveLaunchImage(void) {
+    static BOOL sRemoved = NO;
+    if (sRemoved) return;
+    sRemoved = YES;
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSLog(@"[BlockAds] 移除启动遮罩 (Flutter %@)",
+              sFlutterViewDidAppear ? @"已就绪" : @"安全超时");
+        id appDelegate = safeObjectGetter(UIApplication.sharedApplication, @selector(delegate));
+        safeCallObject0(appDelegate, NSSelectorFromString(@"removeSplashLaunchImage"));
+
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            safeCallObject0(appDelegate, NSSelectorFromString(@"removeSplashLaunchImage"));
+        });
+    });
+}
+
+static void requestRemoveLaunchImage(void) {
+    sNeedRemoveLaunchImage = YES;
+    if (sFlutterViewDidAppear) {
+        performRemoveLaunchImage();
+    }
+}
+
+static IMP orig_flutterVC_viewDidAppear = NULL;
+
+static void hook_flutterVC_viewDidAppear(id self, SEL _cmd, BOOL animated) {
+    if (orig_flutterVC_viewDidAppear) {
+        ((void(*)(id, SEL, BOOL))orig_flutterVC_viewDidAppear)(self, _cmd, animated);
+    }
+    NSLog(@"[BlockAds] Flutter viewDidAppear -> 标记就绪");
+    sFlutterViewDidAppear = YES;
+    if (sNeedRemoveLaunchImage) {
+        performRemoveLaunchImage();
+    }
+}
+
 #pragma mark - 当前 App 开屏专用逻辑
 
 static const void *kBlockAdsHandledKey = &kBlockAdsHandledKey;
@@ -377,7 +422,9 @@ static BOOL isCurrentAppSplashManager(id obj) {
     if (!obj) return NO;
     return [obj respondsToSelector:NSSelectorFromString(@"skipAdSplash")] ||
            [obj respondsToSelector:NSSelectorFromString(@"splashAdFailToPresent:")] ||
-           [obj respondsToSelector:NSSelectorFromString(@"p_splashAdClosed")];
+           [obj respondsToSelector:NSSelectorFromString(@"p_splashAdClosed")] ||
+           [obj respondsToSelector:NSSelectorFromString(@"handler_splashAdFailToPresent:withError:")] ||
+           [obj respondsToSelector:NSSelectorFromString(@"handler_splashAdClosed:")];
 }
 
 static id currentAppSplashManager(id obj) {
@@ -413,23 +460,16 @@ static id currentAppAdSplashOwner(id obj) {
     return nil;
 }
 
-static void removeCurrentAppLaunchImage(void) {
-    id appDelegate = safeObjectGetter(UIApplication.sharedApplication, @selector(delegate));
-    safeCallObject0(appDelegate, NSSelectorFromString(@"removeSplashLaunchImage"));
-}
-
 static void clearCurrentAppSplashUI(id obj, NSString *reason) {
     dispatch_async(dispatch_get_main_queue(), ^{
         id adSplashOwner = currentAppAdSplashOwner(obj);
         NSLog(@"[BlockAds] 清理启动遮罩: %@", reason ?: @"unknown");
-        removeCurrentAppLaunchImage();
+
+        // 移除广告视图（如果存在）
         safeCallObject0(adSplashOwner, NSSelectorFromString(@"removSplashView"));
 
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.30 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            removeCurrentAppLaunchImage();
-            safeCallObject0(adSplashOwner, NSSelectorFromString(@"removSplashView"));
-        });
+        // 启动遮罩延迟到 Flutter 就绪后移除，避免黑屏
+        requestRemoveLaunchImage();
     });
 }
 
@@ -439,6 +479,8 @@ static void driveCurrentAppSplashFailure(id obj, NSString *reason) {
 
         if ([obj respondsToSelector:NSSelectorFromString(@"handler_splashAdFailToPresent:withError:")]) {
             safeCallObject2(obj, NSSelectorFromString(@"handler_splashAdFailToPresent:withError:"), nil, adBlockError());
+        } else if (manager && [manager respondsToSelector:NSSelectorFromString(@"handler_splashAdFailToPresent:withError:")]) {
+            safeCallObject2(manager, NSSelectorFromString(@"handler_splashAdFailToPresent:withError:"), nil, adBlockError());
         } else if (manager && [manager respondsToSelector:NSSelectorFromString(@"splashAdFailToPresent:")]) {
             safeCallObjectU64(manager, NSSelectorFromString(@"splashAdFailToPresent:"), 0);
         } else if (manager && [manager respondsToSelector:NSSelectorFromString(@"skipAdSplash")]) {
@@ -460,8 +502,8 @@ static void fastFinishCurrentAppSplash(id obj, NSString *reason) {
 }
 
 static void hook_app_delegate_bd_removeSplashLaunchImage(id self, SEL _cmd) {
-    NSLog(@"[BlockAds] 加速移除 AppDelegate 启动遮罩");
-    clearCurrentAppSplashUI(nil, @"AppDelegate bd_removeSplashLaunchImage");
+    NSLog(@"[BlockAds] bd_removeSplashLaunchImage -> 等待 Flutter 就绪后移除");
+    requestRemoveLaunchImage();
 }
 
 static void hook_current_app_preSelectorOrderAtLaunch(id self, SEL _cmd, BOOL isHotLaunch) {
@@ -507,6 +549,16 @@ static void hook_current_app_operateSplashLoadAndShow(id self, SEL _cmd, id cust
     fastFinishCurrentAppSplash(self, @"TMEAdOperateSplash loadAndShow");
 }
 
+static void hook_current_app_operateSplashPreloadOrder(id self, SEL _cmd, id order) {
+    NSLog(@"[BlockAds] 短路 TMEAdOperateSplash preLoadSplashOrder");
+    fastFinishCurrentAppSplash(self, @"TMEAdOperateSplash preLoadSplashOrder");
+}
+
+static void hook_current_app_operateSplashPreloadWithOrder(id self, SEL _cmd, id order) {
+    NSLog(@"[BlockAds] 短路 TMEAdOperateSplash preLoadSplashWithOrder");
+    fastFinishCurrentAppSplash(self, @"TMEAdOperateSplash preLoadSplashWithOrder");
+}
+
 static BOOL hook_current_app_operateSplashShow(id self, SEL _cmd, id order, id customUI, id containerView) {
     NSLog(@"[BlockAds] 阻止 TMEAdOperateSplash 真正展示开屏");
     fastFinishCurrentAppSplash(self, @"TMEAdOperateSplash showSplash");
@@ -546,6 +598,18 @@ static void hook_current_app_tmeSplashLoadAndShow(id self, SEL _cmd, id customUI
     NSLog(@"[BlockAds] 短路 TMEAdSplashAd loadAndShow");
     safeCallObject0(self, NSSelectorFromString(@"loader_loadAdTimeout"));
     fastFinishCurrentAppSplash(self, @"TMEAdSplashAd loadAndShow");
+}
+
+static void hook_current_app_tmeSplashPreloadOrder(id self, SEL _cmd, id order) {
+    NSLog(@"[BlockAds] 短路 TMEAdSplashAd preLoadSplashOrder");
+    safeCallObject0(self, NSSelectorFromString(@"loader_loadAdTimeout"));
+    fastFinishCurrentAppSplash(self, @"TMEAdSplashAd preLoadSplashOrder");
+}
+
+static void hook_current_app_tmeSplashPreloadWithOrder(id self, SEL _cmd, id order) {
+    NSLog(@"[BlockAds] 短路 TMEAdSplashAd preLoadSplashWithOrder");
+    safeCallObject0(self, NSSelectorFromString(@"loader_loadAdTimeout"));
+    fastFinishCurrentAppSplash(self, @"TMEAdSplashAd preLoadSplashWithOrder");
 }
 
 static void hook_current_app_tmeSplashLoadData(id self, SEL _cmd, id platformId) {
@@ -970,6 +1034,8 @@ static void tryHookAdClasses(void) {
         {"AdSplash", NO, @selector(splashAdClosed:), (IMP)hook_current_app_adSplashClosed, &orig_adSplash_closed},
         {"AdSplash", NO, @selector(splashShowFininshed:finishType:), (IMP)hook_current_app_adSplashFinished, &orig_adSplash_finished},
 
+        {"TMEAdOperateSplash", NO, @selector(preLoadSplashOrder:), (IMP)hook_current_app_operateSplashPreloadOrder, NULL},
+        {"TMEAdOperateSplash", NO, @selector(preLoadSplashWithOrder:), (IMP)hook_current_app_operateSplashPreloadWithOrder, NULL},
         {"TMEAdOperateSplash", NO, @selector(loadAdAndShowSplashWithCustomUIModel:inContainerView:), (IMP)hook_current_app_operateSplashLoadAndShow, NULL},
         {"TMEAdOperateSplash", NO, @selector(showSplashWithOrder:withCustomUI:inContainerView:), (IMP)hook_current_app_operateSplashShow, NULL},
 
@@ -978,10 +1044,14 @@ static void tryHookAdClasses(void) {
         {"TMEAdOperateSplashManager", NO, @selector(splashAdFailToPresent:), (IMP)hook_current_app_managerFailToPresent, &orig_manager_failToPresent},
         {"TMEAdOperateSplashManager", NO, @selector(p_splashAdClosed), (IMP)hook_current_app_managerClosed, &orig_manager_pSplashClosed},
 
+        {"TMEAdSplashAd", NO, @selector(preLoadSplashOrder:), (IMP)hook_current_app_tmeSplashPreloadOrder, NULL},
+        {"TMEAdSplashAd", NO, @selector(preLoadSplashWithOrder:), (IMP)hook_current_app_tmeSplashPreloadWithOrder, NULL},
         {"TMEAdSplashAd", NO, @selector(loadAdAndShowSplashWithCustomUIModel:inContainerView:), (IMP)hook_current_app_tmeSplashLoadAndShow, NULL},
         {"TMEAdSplashAd", NO, @selector(loader_loadAdDataWithPlatformId:), (IMP)hook_current_app_tmeSplashLoadData, NULL},
         {"TMEAdSplashAd", NO, @selector(handler_splashAdFailToPresent:withError:), (IMP)hook_current_app_tmeSplashHandlerFail, &orig_tmeSplash_handler_failToPresent},
         {"TMEAdSplashAd", NO, @selector(handler_splashAdClosed:), (IMP)hook_current_app_tmeSplashHandlerClosed, &orig_tmeSplash_handler_closed},
+
+        {"BDHomeFlutterViewController", NO, @selector(viewDidAppear:), (IMP)hook_flutterVC_viewDidAppear, &orig_flutterVC_viewDidAppear},
     };
 
     int total = sizeof(entries) / sizeof(entries[0]);
@@ -1037,7 +1107,7 @@ static void scanAndRemoveAdViews(void) {
 __attribute__((constructor))
 static void BlockAdsInit(void) {
     NSLog(@"[BlockAds] ======================================");
-    NSLog(@"[BlockAds] 当前 App 启动广告插件 v4.0 已加载");
+    NSLog(@"[BlockAds] 当前 App 启动广告插件 v5.1 已加载");
     NSLog(@"[BlockAds] ======================================");
 
     hookedClasses = [NSMutableSet set];
@@ -1061,7 +1131,14 @@ static void BlockAdsInit(void) {
     // 4. dyld 回调监听后续加载
     _dyld_register_func_for_add_image(onImageAdded);
 
-    // 5. 兜底扫描，防止 AdSplash 自定义视图残留
+    // 5. 安全超时: 3 秒后强制移除启动遮罩（防止 Flutter hook 未触发）
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        if (sNeedRemoveLaunchImage) {
+            performRemoveLaunchImage();
+        }
+    });
+
+    // 6. 兜底扫描，防止 AdSplash 自定义视图残留
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
         NSTimer *timer = [NSTimer timerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t) {
             scanAndRemoveAdViews();
