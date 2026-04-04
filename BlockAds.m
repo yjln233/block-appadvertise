@@ -1,5 +1,5 @@
 /**
- * BlockAds - 当前 App 启动广告拦截插件 v5.2
+ * BlockAds - 当前 App 启动广告拦截插件 v5.3
  * 纯 ObjC Runtime，无越狱依赖，轻松签注入
  *
  * 核心机制:
@@ -413,6 +413,7 @@ static IMP orig_adSplash_failToPresent = NULL;
 static IMP orig_adSplash_willClosed = NULL;
 static IMP orig_adSplash_closed = NULL;
 static IMP orig_adSplash_finished = NULL;
+static IMP orig_adSplash_getSplashFetchDelay = NULL;
 static IMP orig_manager_failToPresent = NULL;
 static IMP orig_manager_pSplashClosed = NULL;
 static IMP orig_tmeSplash_handler_failToPresent = NULL;
@@ -590,6 +591,11 @@ static void hook_current_app_adSplashFinished(id self, SEL _cmd, id ad, long lon
     clearCurrentAppSplashUI(self, @"AdSplash splashShowFinished");
 }
 
+static id hook_current_app_getSplashFetchDelay(id self, SEL _cmd) {
+    NSLog(@"[BlockAds] AdSplash getSplashFetchDelay -> 0");
+    return @"0";
+}
+
 static void hook_current_app_operateSplashLoadAndShow(id self, SEL _cmd, id customUI, id containerView) {
     NSLog(@"[BlockAds] 短路 TMEAdOperateSplash loadAndShow");
     fastFinishCurrentAppSplash(self, @"TMEAdOperateSplash loadAndShow");
@@ -634,9 +640,7 @@ static void hook_current_app_managerFailToPresent(id self, SEL _cmd, unsigned lo
 }
 
 static void hook_current_app_managerClosed(id self, SEL _cmd) {
-    if (orig_manager_pSplashClosed) {
-        ((void(*)(id, SEL))orig_manager_pSplashClosed)(self, _cmd);
-    }
+    safeCallObject0(self, NSSelectorFromString(@"splashAdClosed"));
     clearCurrentAppSplashUI(self, @"TMEAdOperateSplashManager p_splashAdClosed");
 }
 
@@ -1081,6 +1085,7 @@ static void tryHookAdClasses(void) {
         {"AdSplash", NO, @selector(splashAdWillClosed:), (IMP)hook_current_app_adSplashWillClosed, &orig_adSplash_willClosed},
         {"AdSplash", NO, @selector(splashAdClosed:), (IMP)hook_current_app_adSplashClosed, &orig_adSplash_closed},
         {"AdSplash", NO, @selector(splashShowFininshed:finishType:), (IMP)hook_current_app_adSplashFinished, &orig_adSplash_finished},
+        {"AdSplash", NO, @selector(getSplashFetchDelay), (IMP)hook_current_app_getSplashFetchDelay, &orig_adSplash_getSplashFetchDelay},
 
         {"TMEAdOperateSplash", NO, @selector(preLoadSplashOrder:), (IMP)hook_current_app_operateSplashPreloadOrder, NULL},
         {"TMEAdOperateSplash", NO, @selector(preLoadSplashWithOrder:), (IMP)hook_current_app_operateSplashPreloadWithOrder, NULL},
@@ -1155,7 +1160,7 @@ static void scanAndRemoveAdViews(void) {
 __attribute__((constructor))
 static void BlockAdsInit(void) {
     NSLog(@"[BlockAds] ======================================");
-    NSLog(@"[BlockAds] 当前 App 启动广告插件 v5.2 已加载");
+    NSLog(@"[BlockAds] 当前 App 启动广告插件 v5.3 已加载");
     NSLog(@"[BlockAds] ======================================");
 
     hookedClasses = [NSMutableSet set];
