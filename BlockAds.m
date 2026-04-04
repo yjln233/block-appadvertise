@@ -1,11 +1,11 @@
 /**
- * BlockAds - 当前 App 启动广告拦截插件 v5.1
+ * BlockAds - 当前 App 启动广告拦截插件 v5.2
  * 纯 ObjC Runtime，无越狱依赖，轻松签注入
  *
  * 核心机制:
  * 1. 直接拦截当前 App 的 AdSplash / TMEAd 开屏链路
  * 2. 强制提前结束启动广告状态机，避免等待选单/资源/跳过计时
- * 3. 等待 Flutter 渲染就绪后再移除启动遮罩，避免黑屏
+ * 3. 直接拆除 AppDelegate 黑底启动层，并立即移除启动遮罩
  * 4. 保留最小视图层兜底，处理残留的启动广告视图
  */
 
@@ -335,10 +335,40 @@ static BOOL isAdClass(NSString *name) {
 
 static void safeCallObject0(id obj, SEL sel);
 
-#pragma mark - Flutter 就绪检测与启动遮罩延迟移除
+#pragma mark - Flutter 就绪兜底与启动遮罩移除
 
 static BOOL sFlutterViewDidAppear = NO;
 static BOOL sNeedRemoveLaunchImage = NO;
+static IMP orig_app_delegate_setBdAppStartBGView = NULL;
+static IMP orig_app_delegate_createBDAppStartContentView = NULL;
+
+static void stripCurrentAppBackdropView(id view, NSString *reason) {
+    if (![view isKindOfClass:[UIView class]]) return;
+    UIView *bgView = (UIView *)view;
+    NSLog(@"[BlockAds] 拆除黑底启动层: %@", reason ?: @"unknown");
+    bgView.hidden = YES;
+    bgView.alpha = 0;
+    [bgView removeFromSuperview];
+}
+
+static void clearCurrentAppBackdropProperty(id appDelegate) {
+    SEL setter = NSSelectorFromString(@"setBdAppStartBGView:");
+    if (!appDelegate || ![appDelegate respondsToSelector:setter]) return;
+    if (orig_app_delegate_setBdAppStartBGView) {
+        ((void(*)(id, SEL, id))orig_app_delegate_setBdAppStartBGView)(appDelegate, setter, nil);
+        return;
+    }
+    ((void(*)(id, SEL, id))objc_msgSend)(appDelegate, setter, nil);
+}
+
+static void stripCurrentAppLaunchBackdrop(id appDelegate, NSString *reason) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        id resolvedAppDelegate = appDelegate ?: safeObjectGetter(UIApplication.sharedApplication, @selector(delegate));
+        id bgView = safeObjectGetter(resolvedAppDelegate, NSSelectorFromString(@"bdAppStartBGView"));
+        stripCurrentAppBackdropView(bgView, reason);
+        clearCurrentAppBackdropProperty(resolvedAppDelegate);
+    });
+}
 
 static void performRemoveLaunchImage(void) {
     static BOOL sRemoved = NO;
@@ -346,13 +376,14 @@ static void performRemoveLaunchImage(void) {
     sRemoved = YES;
 
     dispatch_async(dispatch_get_main_queue(), ^{
-        NSLog(@"[BlockAds] 移除启动遮罩 (Flutter %@)",
-              sFlutterViewDidAppear ? @"已就绪" : @"安全超时");
+        NSLog(@"[BlockAds] 立即移除启动遮罩");
         id appDelegate = safeObjectGetter(UIApplication.sharedApplication, @selector(delegate));
+        stripCurrentAppLaunchBackdrop(appDelegate, @"performRemoveLaunchImage");
         safeCallObject0(appDelegate, NSSelectorFromString(@"removeSplashLaunchImage"));
 
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
+            stripCurrentAppLaunchBackdrop(appDelegate, @"performRemoveLaunchImage retry");
             safeCallObject0(appDelegate, NSSelectorFromString(@"removeSplashLaunchImage"));
         });
     });
@@ -360,9 +391,7 @@ static void performRemoveLaunchImage(void) {
 
 static void requestRemoveLaunchImage(void) {
     sNeedRemoveLaunchImage = YES;
-    if (sFlutterViewDidAppear) {
-        performRemoveLaunchImage();
-    }
+    performRemoveLaunchImage();
 }
 
 static IMP orig_flutterVC_viewDidAppear = NULL;
@@ -373,9 +402,7 @@ static void hook_flutterVC_viewDidAppear(id self, SEL _cmd, BOOL animated) {
     }
     NSLog(@"[BlockAds] Flutter viewDidAppear -> 标记就绪");
     sFlutterViewDidAppear = YES;
-    if (sNeedRemoveLaunchImage) {
-        performRemoveLaunchImage();
-    }
+    performRemoveLaunchImage();
 }
 
 #pragma mark - 当前 App 开屏专用逻辑
@@ -468,7 +495,8 @@ static void clearCurrentAppSplashUI(id obj, NSString *reason) {
         // 移除广告视图（如果存在）
         safeCallObject0(adSplashOwner, NSSelectorFromString(@"removSplashView"));
 
-        // 启动遮罩延迟到 Flutter 就绪后移除，避免黑屏
+        // 直接拆掉当前 App 的启动黑底层与启动遮罩
+        stripCurrentAppLaunchBackdrop(nil, reason);
         requestRemoveLaunchImage();
     });
 }
@@ -502,8 +530,26 @@ static void fastFinishCurrentAppSplash(id obj, NSString *reason) {
 }
 
 static void hook_app_delegate_bd_removeSplashLaunchImage(id self, SEL _cmd) {
-    NSLog(@"[BlockAds] bd_removeSplashLaunchImage -> 等待 Flutter 就绪后移除");
+    NSLog(@"[BlockAds] bd_removeSplashLaunchImage -> 立即拆除启动遮罩");
+    stripCurrentAppLaunchBackdrop(self, @"AppDelegate bd_removeSplashLaunchImage");
     requestRemoveLaunchImage();
+}
+
+static id hook_app_delegate_createBDAppStartContentView(id self, SEL _cmd) {
+    id view = nil;
+    if (orig_app_delegate_createBDAppStartContentView) {
+        view = ((id(*)(id, SEL))orig_app_delegate_createBDAppStartContentView)(self, _cmd);
+    }
+    stripCurrentAppBackdropView(view, @"AppDelegate createBDAppStartContentView");
+    stripCurrentAppLaunchBackdrop(self, @"AppDelegate createBDAppStartContentView");
+    return nil;
+}
+
+static void hook_app_delegate_setBdAppStartBGView(id self, SEL _cmd, id view) {
+    stripCurrentAppBackdropView(view, @"AppDelegate setBdAppStartBGView");
+    if (orig_app_delegate_setBdAppStartBGView) {
+        ((void(*)(id, SEL, id))orig_app_delegate_setBdAppStartBGView)(self, _cmd, nil);
+    }
 }
 
 static void hook_current_app_preSelectorOrderAtLaunch(id self, SEL _cmd, BOOL isHotLaunch) {
@@ -1026,6 +1072,8 @@ static void tryHookAdClasses(void) {
 
     struct HookEntry entries[] = {
         {"AppDelegate", NO, @selector(bd_removeSplashLaunchImage), (IMP)hook_app_delegate_bd_removeSplashLaunchImage, NULL},
+        {"AppDelegate", NO, @selector(createBDAppStartContentView), (IMP)hook_app_delegate_createBDAppStartContentView, &orig_app_delegate_createBDAppStartContentView},
+        {"AppDelegate", NO, @selector(setBdAppStartBGView:), (IMP)hook_app_delegate_setBdAppStartBGView, &orig_app_delegate_setBdAppStartBGView},
 
         {"AdSplash", NO, @selector(preSelectorOrderAtLaunch:), (IMP)hook_current_app_preSelectorOrderAtLaunch, NULL},
         {"AdSplash", NO, @selector(showSplashAtLaunch), (IMP)hook_current_app_showSplashAtLaunch, NULL},
@@ -1107,7 +1155,7 @@ static void scanAndRemoveAdViews(void) {
 __attribute__((constructor))
 static void BlockAdsInit(void) {
     NSLog(@"[BlockAds] ======================================");
-    NSLog(@"[BlockAds] 当前 App 启动广告插件 v5.1 已加载");
+    NSLog(@"[BlockAds] 当前 App 启动广告插件 v5.2 已加载");
     NSLog(@"[BlockAds] ======================================");
 
     hookedClasses = [NSMutableSet set];
